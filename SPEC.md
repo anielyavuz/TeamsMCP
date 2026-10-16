@@ -36,7 +36,8 @@ mesajları, toplantı transkriptleri, dosya indirme.
 
 ### Kişi ve ortam
 * Python 3.10 ya da üstü, git, VS Code (MCP desteği olan sürüm) ya da başka bir MCP istemcisi.
-* macOS, Linux ya da Windows. (Geliştirme Python 3.10 ve macOS ile yapıldı.)
+* macOS ya da Linux. Geliştirme Python 3.10 ve macOS ile yapıldı. `os.fchmod` ve `O_NOFOLLOW` gibi POSIX özelliklerine dayanıldığı için
+  **Windows desteği doğrulanmadı**, gerekiyorsa dosya izni kodu ayrıca ele alınmalıdır.
 
 ### Microsoft 365 tarafı (kuruluşta bir yönetici gerekir)
 * Entra'da **tek tenant** bir uygulama kaydı:
@@ -59,9 +60,10 @@ httpx==0.28.1         # Graph'a HTTP istekleri
 uvicorn==0.54.0       # HTTP sunucusu
 python-dotenv==1.2.3  # .env okumak için
 ```
-Geliştirme: `pytest`. Geçişli bağımlılıklar `constraints.txt` ile sabitlenir (`pip freeze` çıktısından),
-hash'li kilit dosyası `pip-compile --generate-hashes --strip-extras -c constraints.txt requirements.txt`
-ile üretilir ve `pip install --require-hashes -r requirements.lock.txt` ile kurulur. İsteğe bağlı:
+Geliştirme: `requirements-dev.txt` içinde `-r requirements.txt` ve sabit sürümlü `pytest`. Geçişli bağımlılıklar `constraints.txt` ile
+sabitlenir: yalnızca çalışma bağımlılıklarını içeren temiz bir ortamdan (pytest, pip-audit, pip-tools **hariç**) `pip freeze` ya da
+`pip-compile requirements.txt -o constraints.txt` ile üretilir. Hash'li kilit dosyası `pip-compile --generate-hashes --strip-extras -c constraints.txt requirements.txt`
+ile üretilir (`pip-tools` ve `pip-audit` proje ortamına değil, ayrı bir geçici ortama kurulur) ve `pip install --require-hashes -r requirements.lock.txt` ile kurulur. İsteğe bağlı:
 `msal-extensions` (Keychain/DPAPI için). Bilinen açıklar için `pip-audit -r constraints.txt --no-deps`.
 
 ---
@@ -103,6 +105,8 @@ README.md, SECURITY.md, LICENSE (MIT), .env.example, requirements*.txt, constrai
 * Araç kaydı: `server.add_tool(fn, name=..., title=..., description=..., annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, openWorldHint=False))`.
 * HTTP: `server.streamable_http_app(stateless_http=True, host=config.host)`, önüne bizim `Gatekeeper` ASGI katmanı konur, `uvicorn.run(...)` ile çalıştırılır.
 * stdio: `anyio.run(server.run_stdio_async)`. stdio'da stdout MCP mesajlarına ayrılmıştır, bilgi satırları stderr'e yazılır.
+  `ToolAnnotations` `mcp.types` içindedir. Yapıcıya camelCase alias verilir (`readOnlyHint=True`), nesne üzerinde öznitelikler snake_case'tir
+  (`read_only_hint`), HTTP çıktısında yine camelCase görünür. Bilinmeyen araç çağrısı JSON-RPC hatası değil `isError: true` araç sonucu döner.
 * Araç parametreleri snake_case (`chat_id`). Araç açıklamaları İngilizce yazılır, çünkü modeli yönlendirir.
 
 ---
@@ -125,6 +129,12 @@ README.md, SECURITY.md, LICENSE (MIT), .env.example, requirements*.txt, constrai
 * Token önbelleği `~/.msteams-mcp/token-cache.json`: klasör 700, dosya 600. Yazma **atomik** (aynı klasörde 600 izinli
   geçici dosya, sonra `os.replace`), sembolik bağ izlenmez, yarım yazılmış/bozuk dosya sunucuyu kilitlemez
   (boş önbellek sayılır, yeniden login istenir).
+* Sembolik bağ kuralı: **yazma** bağın kendisini değiştirir, hedef dosyaya dokunmaz. **Okuma** yalnızca normal dosyada yapılır.
+* `auth_status` (ve `status()`/`username()`) Graph'a hiç gitmez. Token'ı sessizce yenilemek için MSAL Microsoft'a bağlanabilir, bu yüzden
+  yalnızca önbellekteki hesabı okuyup ağsız çalışan bir biçim tercih edilir. `PublicClientApplication` kurulurken de yetki adresi için
+  Microsoft'a bağlanır, bu yüzden birim testlerde sahtelenmeli ya da tembel (ilk gerçek kullanımda) kurulmalıdır.
+* Login sonrası eski hesapların temizlenmesi için yeni hesap `oid` (local_account_id) ile eşlenir. MSAL önbelleği sıfırlamak için genel bir
+  yöntem sunmaz, `deserialize("{}")` kullanılır.
 * Dosya başka süreç tarafından değişmiş olabilir, her kullanımdan önce mtime kontrol edilip yeniden okunur.
 * İsteğe bağlı `TOKEN_STORE=keychain`: `msal_extensions.PersistedTokenCache` ve `build_encrypted_persistence`
   (macOS Keychain, Windows DPAPI, Linux libsecret). Kütüphane yoksa anlaşılır hata verir.
@@ -135,11 +145,15 @@ README.md, SECURITY.md, LICENSE (MIT), .env.example, requirements*.txt, constrai
 
 ### 4.3 graph.py
 * `Graph(get_token)`; token her istekte yeniden sorulur.
-* `get(path_or_url)` **yalnızca GET**. Adres `https://graph.microsoft.com/v1.0/` ile başlamıyorsa `ValueError`
-  (sonraki sayfa bağlantısı dışarıdan geldiği için token başka hosta gitmesin). Yönlendirme izlenmez.
-* 429/503/504'te `Retry-After` kadar (en çok 30 sn) bekleyip en fazla 3 kez yeniden dener. Zaman aşımı 30 sn.
-* `get_paged(path, max_items, max_pages, stop)` sonraki sayfa bağlantılarını katı sınırlarla izler,
-  `(kayıtlar, devamı_var_mı)` döner.
+* `get(path_or_url)` **yalnızca GET**. `/` ile başlayan değer göreli yoldur ve `https://graph.microsoft.com/v1.0` ön ekine eklenir. Mutlak adres
+  yalnızca `https://graph.microsoft.com/v1.0/` ile başlıyorsa kabul edilir. `http://...` ya da başka host `ValueError` verir (sonraki sayfa
+  bağlantısı dışarıdan geldiği için token başka hosta gitmesin). Mutlak adres olup olmadığı `https://` ile değil **tam ön ekle** karşılaştırılır.
+  Yönlendirme izlenmez.
+* 429/503/504'te `Retry-After` kadar (en çok 30 sn) bekleyip **en fazla 3 kez yeniden dener** (toplam 4 deneme). Zaman aşımı 30 sn, aşılırsa
+  httpx zaman aşımı istisnası yayılır ve `describe_error` bunu sınıf adından tanır (`TimeoutException`, `ReadTimeout`, `ConnectTimeout`).
+* `get_paged(path, max_items, max_pages, stop)` sonraki sayfa bağlantılarını katı sınırlarla izler. `stop(kayıt)` her kayıt için sırayla çağrılır,
+  `True` dönerse sayfalama durur ve o kayıt sonuca **eklenmez** (dönüş `(kayıtlar, False)`). `stop` kaydı kendisi biriktirebilir. Aksi halde
+  `(kayıtlar, devamı_var_mı)` döner. Devamı var mı bilgisi sonraki sayfa bağlantısının ya da sınıra çarpmanın varlığından çıkarılır.
 * `GraphError(status, code, message)`.
 
 ### 4.4 format.py
@@ -156,21 +170,31 @@ README.md, SECURITY.md, LICENSE (MIT), .env.example, requirements*.txt, constrai
   mesajın gövdesi boş. Gövde önce politika (maskele, kes) sonra sarmalama.
 * `summarize_chat(c, policy)`: `id, chatType, topic, tarihler, memberCount, members` (en çok 20), son mesaj
   önizlemesi (en çok 200 karakter, sarılmış).
+* Güvenilmeyen metin yalnızca gövde değildir. `topic`, `subject`, üye adları, gönderen adları ve ek dosya adlarını da başkaları belirler.
+  Bunlar için en az: görünmeyen karakterler `clean_text` ile silinir, uzunluk (örneğin 200 karakter) sınırlanır ve `notice` metni bu alanları da
+  kapsar. (Referans uygulama şu an yalnızca `subject`'i temizliyor, bu alanların tamamının kapsanması bağımsız yeniden yazımda bulunan bir iyileştirmedir.)
 * `format=html` seçeneği **bilerek yoktur** (ham HTML gizli içerik taşır).
 
 ### 4.5 policy.py
 * `Policy(allowed_chat_types, allowed_chat_ids, max_body_chars=4000, mask_sensitive=True)`:
   `chat_allowed(chat_id, chat_type=None)` ve `process(text)` (önce maskele, sonra kes ve "N karakter kesildi" ekle).
+  İki liste birden doluysa **ikisi de sağlanmalıdır (VE)**. Tür kısıtı varken sohbet türü bilinmiyorsa reddedilir (kapalı hata). Boş liste kısıt yok demektir.
 * `mask_sensitive`: yalnızca **doğrulanabilen** kalıpları gizler, yanlış alarm riskini düşük tutar:
   IBAN (mod 97), kart numarası (Luhn), T.C. kimlik no (resmi sağlama toplamı), JWT, `Bearer` token,
-  `parola|şifre|password|pwd|secret|api key|token : değer` satırları. Sipariş numarası, tarih gibi
+  `parola|şifre|password|pwd|secret|api key|token` anahtar sözcüğünden sonra gelen `:` ya da `=` ile verilen değer (değer boşluğa kadar tek sözcük).
+  IBAN adayı regex ile bulunur ve mod 97 ile doğrulanır, doğrulanmazsa dokunulmaz (boşluklu yazım desteklenir). Maskeleme sohbet önizlemesine
+  de uygulanır. Sipariş numarası, tarih gibi
   sıradan sayılara dokunmaz. DLP ürününün yerine geçmez.
 * `Quota(max_calls=120, max_kb=4096)`: kayan 1 saatlik pencerede araç çağrısı sayısı ve modele giden veri (KB).
-  Dolunca çağrı reddedilir, `0` sınırsız. `auth_status` kotaya dahil değildir.
+  Dolunca çağrı reddedilir, `0` sınırsız. Kontrol çağrıdan **önce**, kayıt çağrıdan **sonra** yapılır, bu yüzden sınır en çok bir çağrı kadar
+  aşılabilir. KB, aracın döndürdüğü JSON metninin boyutudur (ham Graph cevabı değil). Reddedilen çağrılar sayılmaz. `auth_status` kotaya dahil değildir
+  (`Tool.counts_toward_quota=False`).
 
 ### 4.6 audit.py
 * Her istek için terminale (stderr) bir satır, `LOG_FILE` doluysa aynı bilgi JSON satırı olarak dosyaya.
   Dosya `os.open(..., 0o600)` ile açılır ve **her yazımda** `fchmod 600` uygulanır.
+* Kimlik no süreç içi sayaçtır, süreç yeniden başlayınca 1'den başlar. Kullanıcı (UPN) her çağrıda token dosyasından okunur (küçük bir maliyet).
+  Ayrıntı alanındaki kayıt sayısı, araç sonucundaki tam sayı `count` alanından alınır (bu alan sözleşmenin parçasıdır).
 * Kayıt: kimlik no, işlem, güvenli argüman özeti, sonuç (ok / tool error / rpc error), ayrıntı (kayıt sayısı),
   süre, KB, kullanıcı (UPN), istemci adı ve sürümü.
 * `arg_summary`: `limit, order, chat_type, since, until, include_system_messages` olduğu gibi; `*id` alanları
@@ -178,7 +202,7 @@ README.md, SECURITY.md, LICENSE (MIT), .env.example, requirements*.txt, constrai
 * **Mesaj içeriği, token ve serbest metin asla yazılmaz.**
 
 ### 4.7 http_app.py (Gatekeeper)
-En dıştaki ASGI katmanı. Sıra: Host (403) → Origin (403) → adres `/mcp` (404) → Bearer token (401) → yöntem POST (405).
+En dıştaki ASGI katmanı. Kontrol sırası: Host (403), Origin (403), adres `/mcp` (404), Bearer token (401), yöntem POST (405).
 * Host `127.0.0.1:PORT`, `localhost:PORT`, `[::1]:PORT` ile tam eşleşmeli (DNS rebinding).
 * Origin yoksa geçer; varsa yalnızca `http(s)://` + yerel adres + sunucu portu (tarayıcıdaki yabancı sayfayı reddeder).
   MCP kütüphanesi de aynı kontrolü yapar, ona bağımlı kalmamak için kendi kontrolümüz de vardır.
@@ -186,6 +210,9 @@ En dıştaki ASGI katmanı. Sıra: Host (403) → Origin (403) → adres `/mcp` 
 * Gövde en çok 1 MB, okuma 10 sn zaman aşımı (408), gövde tamponlanıp MCP uygulamasına yeniden verilir (loglama için).
 * Cevap istemciye aynen gider, log için yalnızca ilk 256 KB okunur. JSON-RPC mesajları ayrıştırılıp `tools/call` için
   araç adı ve sonuç özeti loglanır, bildirimler loglanmaz.
+* Durumsuz (stateless) HTTP'de `initialize` ayrı bir istektir, sonraki `tools/call` istemci adını taşımaz. Bu yüzden `ClientRegistry` istemci adını
+  User-Agent başına hatırlar. `limit_concurrency` aşılırsa uvicorn 503 döner. 10 sn gövde zaman aşımı yalnızca uygulama katmanındadır,
+  bağlantı seviyesindeki yavaş istemciler için `timeout_keep_alive` devreye girer.
 * Reddedilen isteklerde art arda 10'dan fazla ret/dakika olursa 1 sn gecikme eklenir ve log dosyası şişirilmez
   (kilitleme yok, yerel biri gerçek kullanıcıyı dışarıda bırakamasın). User-Agent kontrol karakterlerinden
   arındırılıp 100 karaktere kısaltılır. Kendi yanıtlarımıza `Cache-Control: no-store` ve `X-Content-Type-Options: nosniff`.
@@ -193,11 +220,12 @@ En dıştaki ASGI katmanı. Sıra: Host (403) → Origin (403) → adres `/mcp` 
 * `/health`, `/debug`, docs gibi ek uç yok. `stateless_http=True`.
 
 ### 4.8 tools
-* `Tool(name, title, description, access ["read"|"write"], scopes, build)`. `Deps(graph, auth, policy, audit, quota, log_calls)`.
+* `Tool(name, title, description, access ["read"|"write"], scopes, build, counts_toward_quota=True)`. `build(deps)` aracın asıl `async` fonksiyonunu döndürür.
+  `Deps(graph, auth, policy, audit, quota, log_calls)`. Araç sonuçları sözlüktür, `list_chats` ve `get_chat_messages` sonuçlarında tam sayı `count` alanı bulunur.
 * `select_tools(names, allow_write_tools)`: bilinmeyen araç adı ve `ALLOW_WRITE_TOOLS=true` olmayan yazma aracı reddedilir.
   `required_scopes` açık araçlardan izinleri (artı `User.Read`) hesaplar.
 * Sarmalayıcı (`_as_tool_result`): kota kontrolü, hata çevirme, sonucu JSON metnine çevirme, **stdio'da** denetim kaydı
-  (`client: stdio`; HTTP'de kaydı Gatekeeper tutar, çift kayıt olmasın).
+  (`client: stdio`, istemci adı bu yolda bilinmez; HTTP'de kaydı Gatekeeper tutar, çift kayıt olmasın).
 * `describe_error`: 401, 403, 404, zaman aşımı için ne yapılacağını söyleyen cümleler. Graph hatalarında yalnızca
   durum ve kod. Beklenmeyen hatada ham metin modele **gitmez** ("Beklenmeyen bir hata oluştu"), ayrıntı yerel loga yazılır.
 * Araçlar:
@@ -301,6 +329,8 @@ Teams verisiyle çalışırken aynı oturumda GitHub, e-posta, web gibi dışar�
 ## 8. Testler
 
 **Birim testleri (ağsız, `python -m pytest`)** en az şunları kapsamalı:
+(Referans uygulamada 24 test vardı, bu belgeden bağımsız bir yeniden yazım 86 test üretti. Sayı normatif değildir, kapsam önemlidir.)
+
 tenant/client doğrulaması, yerel host ve uzun token, bilinmeyen araç ve onaysız yazma aracı, token ve Host kontrolü,
 Origin (yok geçer, yerel geçer, yabancı/`null`/yanlış port/taklit adres reddedilir), Graph dışına gitmeme ve yalnızca GET,
 `describe_error`, HTML dönüşümü, silinmiş mesaj, log özetleme, gövdenin sarılması ve sahte kapatma etiketi,
@@ -309,7 +339,7 @@ sıradan sayılar kalır), politika (izin listesi, kesme), kota (sınır ve penc
 yazımı ve bozuk dosya, art arda ret sayacı ve User-Agent temizliği, ayar doğrulamaları, httpx logger seviyesi,
 log izninin 600'e düzeltilmesi, beklenmeyen hata metninin modele gitmemesi.
 
-**Canlı öz-test (`scripts/selftest.py --live`)**: çalışan sunucuya karşı token yok/yanlış (401), yabancı Host (403),
+**Canlı öz-test (`scripts/selftest.py`, `--live` bayrağıyla gerçek sohbet okuma da denenir)**: çalışan sunucuya karşı token yok/yanlış (401), yabancı Host (403),
 yalnızca izinli araçlar, hepsi salt okunur, olmayan araç reddi, giriş durumu, profil, sohbet ve mesaj okuma, başkasına
 ait sohbet kimliğinin hata vermesi.
 
@@ -328,7 +358,9 @@ ait sohbet kimliğinin hata vermesi.
 * `docs/YOL-HARITASI.md`: sonraki araçlar, her biri için izin ve yönetici onayı gerekliliği; yazma araçları için ön koşullar;
   merkezi sunucu modu (bölüm 14).
 
-Yorum ve belge stili: kod yorumları Türkçe, doğal cümlelerle; uzun tire, madde tiresi, süs çizgisi ve ok işareti kullanılmaz.
+Yorum ve belge stili: kod yorumları Türkçe, doğal cümlelerle; uzun tire, madde tiresi (`*` kullanın), süs çizgisi ve ok işareti kullanılmaz.
+Bu kural kodda ve yazılan belgelerde geçerlidir. `login` uyarısı çerçeve çizmek yerine düz satırlar olarak yazılır. Markdown tablo ayırıcıları serbesttir.
+`docs/ENTRA-KURULUMU.md` zorunludur, `requirements-dev.txt` (pytest) de yazılacak dosyalardandır.
 
 ---
 
@@ -344,7 +376,9 @@ Aşağıdaki metni, bu belgeyle birlikte boş bir klasörde Claude Code'a verin:
 > 4. Ağa çıkan testler yazma, MSAL ve Graph'ı sahtele.
 > 5. Bölüm 9'daki belgeleri Türkçe yaz, kod yorumlarında bölüm 9'daki stil kuralına uy.
 > 6. Bitince `python -m pytest` çıktısını, bölüm 11'deki listenin sonucunu ve gerçekten doğrulayamadıkların listesini ver.
-> 7. Commit ya da push yapma, gizli bilgi taraması yapıp bana sor.
+> 7. Commit ya da push yapma. Gizli bilgi taramasını yap ve sonucu raporla.
+> 8. Yalnızca kendi başlattığın süreçleri durdur. Bilgisayardaki başka süreçleri (örneğin kullanıcının açık MCP bağlantısını) asla sonlandırma.
+> 9. Gerçek Microsoft hesabına bağlanma, gerçek Graph çağrısı yapma. Bu belgede ve kütüphanede uyuşmayan bir şey bulursan sessizce çözme, raporla.
 
 ---
 
@@ -373,6 +407,7 @@ Aşağıdaki metni, bu belgeyle birlikte boş bir klasörde Claude Code'a verin:
 * **VS Code `${input:...}` her istemcide çalışmaz** (bkz. bölüm 7).
 * **Aynı oturumda başka MCP sunucuları** (GitHub vb.) prompt injection ile veri sızdırma yolu olur.
 * **Maskeleme sağlama toplamı olmadan yanlış alarm üretir:** 11 haneli her sayıyı T.C. kimlik no sanmayın.
+* **Ajana süreç öldürme yetkisi verilmemeli:** bağımsız yeniden yazım deneyinde ajan, kullanıcının açık MCP bağlantısını (başka bir `msteams_mcp` süreci) yanlışlıkla sonlandırdı. İstemde yalnızca kendi PID'lerinin durdurulabileceği açıkça yazılmalı.
 * **Kodu "kendi başına öğrenmek isteyen" kullanıcı için:** kurulum adımlarını belgede güncel tutun, geliştirici ortamına el ile kurulum varsayın.
 
 ---
@@ -384,6 +419,15 @@ Aşağıdaki metni, bu belgeyle birlikte boş bir klasörde Claude Code'a verin:
 * Bağımlılık sürümlerinin güvenlik durumu `pip-audit` ile yazım anında temizdi, düzenli yeniden çalıştırılmalı.
 * Graph davranışları (transkript erişimi, toplantı listesi, kanal izinleri) bu belgede doğrulanmadı, yol haritasındaki
   maddeler için ayrıca Microsoft belgelerinden teyit edilmeli.
+
+---
+
+## 13b. Bağımsız yeniden yazım deneyi
+
+Bu belge, kodu hiç görmeyen ayrı bir ajanla (Sonnet 5.5) denendi: yalnızca SPEC.md verildi, 86 testin geçtiği, 12 güvenlik gereksiniminin her biri
+için ayrı testi olan çalışan bir uygulama çıktı. Ajan SPEC'te 20'den fazla belirsizlik ve boşluk raporladı, bu belgenin yukarıdaki ilgili bölümleri
+bunlarla güncellendi. Hâlâ açık kalanlar: gerçek Graph sorgularının (OData `$orderby` ve `$expand` birleşimi dahil) geçerliliği, gerçek cihaz kodu girişi,
+MCP kütüphanesinin Host/Origin kontrolüyle birlikte davranışı ve `TOKEN_STORE=keychain`. Bunlar gerçek bir tenant'ta ayrıca doğrulanmalıdır.
 
 ---
 
