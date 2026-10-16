@@ -1,0 +1,7 @@
+# Bu depoda yalnızca şartname ve temel dosyalar izlenir. Geri kalan her şey (kod, belgeler, ayarlar,
+# loglar, sanal ortam, gizli dosyalar) yerelde durur ama git'e girmez.
+/*
+!/.gitignore
+!/README.md
+!/SPEC.md
+!/LICENSE
